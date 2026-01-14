@@ -1,0 +1,106 @@
+require("dotenv").config();
+const { Client, GatewayIntentBits, Partials } = require("discord.js");
+
+const token = process.env.DISCORD_TOKEN;
+const allowed = new Set(
+  (process.env.ALLOWED_USER_IDS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+
+if (!token) {
+  console.error("❌ .env에 DISCORD_TOKEN이 필요해요.");
+  process.exit(1);
+}
+if (allowed.size === 0) {
+  console.error("❌ .env에 ALLOWED_USER_IDS=내ID,친구ID 형태로 넣어주세요.");
+  process.exit(1);
+}
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.DirectMessages, // ✅ DM에서 인터랙션/채널 사용
+  ],
+  partials: [Partials.Channel], // ✅ DM 채널 접근 안정화
+});
+
+// ===== 조절 가능한 설정 =====
+const MAX_COUNT = 100;     // ✅ 20 -> 100
+const DELAY_MS = 300;      // ✅ 500 -> 300 (너무 낮추면 위험)
+const COOLDOWN_MS = 3000;  // (선택) 명령 쿨다운 3초
+// ==========================
+
+const jobs = new Map();     // key: `${channelId}:${userId}` -> { cancelled: boolean }
+const cooldown = new Map();
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const keyOf = (channelId, userId) => `${channelId}:${userId}`;
+
+client.once("ready", () => {
+  console.log(`Logged in as ${client.user.tag}`);
+});
+
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  if (!allowed.has(interaction.user.id)) {
+    return interaction.reply({ content: "허용된 사용자만 사용할 수 있어요.", ephemeral: true });
+  }
+
+  // /도배중지
+  if (interaction.commandName === "도배중지") {
+    await interaction.deferReply({ ephemeral: true });
+
+    const key = keyOf(interaction.channelId, interaction.user.id);
+    const job = jobs.get(key);
+
+    if (!job) return interaction.editReply("지금 이 채널에서 진행 중인 도배가 없어요.");
+
+    job.cancelled = true;
+    return interaction.editReply("도배를 중지했어!");
+  }
+
+  // /도배
+  if (interaction.commandName === "도배") {
+    await interaction.deferReply({ ephemeral: true });
+
+    const now = Date.now();
+    const last = cooldown.get(interaction.user.id) || 0;
+    if (now - last < COOLDOWN_MS) {
+      const left = Math.ceil((COOLDOWN_MS - (now - last)) / 1000);
+      return interaction.editReply(`쿨다운 중! ${left}초 후 다시 시도해줘.`);
+    }
+    cooldown.set(interaction.user.id, now);
+
+    const msg = interaction.options.getString("메시지", true);
+    let count = interaction.options.getInteger("개수", true);
+    count = Math.max(1, Math.min(MAX_COUNT, count));
+
+    const key = keyOf(interaction.channelId, interaction.user.id);
+    if (jobs.has(key)) {
+      return interaction.editReply("이미 도배가 진행 중이야. 멈추려면 `/도배중지`를 써줘.");
+    }
+
+    const job = { cancelled: false };
+    jobs.set(key, job);
+
+    await interaction.editReply(`도배 시작: ${count}회 (중지: /도배중지)`);
+
+    try {
+      for (let i = 0; i < count; i++) {
+        if (job.cancelled) break;
+        await interaction.channel.send(msg);
+        await sleep(DELAY_MS);
+      }
+    } catch (e) {
+      console.error(e);
+      await interaction.followUp({ content: "전송 중 오류가 나서 중단했어.", ephemeral: true }).catch(() => {});
+    } finally {
+      jobs.delete(key);
+    }
+  }
+});
+
+client.login(token);
